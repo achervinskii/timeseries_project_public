@@ -12,6 +12,7 @@ library(fable)
 library(feasts)
 library(fabletools)
 library(forecast)
+library(MCS)
 
 ## ----- Loading Data -----
 load("citibike.RData")
@@ -65,6 +66,7 @@ ggsave(
 )
 
 ## ----- Correlogram of epsilon_t -----
+png("outputs/partial_corr_eps.png", width = 1200, height = 800, res = 150)
 plt <- resid_tsbl %>% gg_tsdisplay(epsilon, plot_type = "partial", lag_max = 100)
 
 ggsave(
@@ -94,12 +96,19 @@ fit_sarima %>%
 #   select(sarima_auto) %>%
 #   report()
 
+
+png("outputs/sarima_fit_residuals.png", width = 1200, height = 800, res = 150)
 fit_sarima %>%
   select(sarima_1) %>%
   gg_tsresiduals()
+dev.off()
+
+png("outputs/sarima_2_fit_residuals.png", width = 1200, height = 800, res = 150)
 fit_sarima %>%
   select(sarima_2) %>%
   gg_tsresiduals()
+dev.off()
+
 # fit_sarima %>%
 #   select(sarima_auto) %>%
 #   gg_tsresiduals()
@@ -314,3 +323,84 @@ ggsave(
   filename = file.path("outputs", "MAE_sarima_vs_ets.png"),
   width = 10, height = 6
 )
+
+
+## ---- MCS Test ---- 
+# MCS test for multiple horizons (1-24) comparing SARIMA and ETS
+loss_matrix <- cbind(
+  SARIMA = abs(as.vector(err_sarima)),
+  ETS    = abs(as.vector(err_ETS_mat))
+)
+
+mcs_result <- MCSprocedure(Loss = loss_matrix, 
+                           alpha = 0.05, 
+                           B = 5000,
+                           statistic = "Tmax", 
+                           verbose = TRUE)
+
+
+## ---- MCS TEST WITH 3 MODELS ----
+sarima_spec_1 <- ARIMA(epsilon ~ pdq(4, 0, 0) + PDQ(0, 0, 0, period = 24))
+
+roll_results_1 <- vector("list", length(origins))
+
+for (i in seq_along(origins)) {
+  
+  origin <- origins[i]
+  
+  window_data <- df %>%
+    filter(datetime >= origin - hours(window_length), datetime < origin)
+  
+  window_tsbl <- window_data %>%
+    select(datetime, area6, is_weekend, hour_f, month_f) %>%
+    as_tsibble(index = datetime)
+  
+  fit_reg_i <- tryCatch(
+    window_tsbl %>% model(reg = TSLM(area6 ~ 0 + is_weekend:hour_f + month_f)),
+    warning = function(w) window_tsbl %>% model(reg = TSLM(area6 ~ 0 + is_weekend:hour_f)),
+    error   = function(e) window_tsbl %>% model(reg = TSLM(area6 ~ 0 + is_weekend:hour_f))
+  )
+  
+  resid_i <- residuals(fit_reg_i) %>%
+    select(datetime, .resid) %>%
+    rename(epsilon = .resid) %>%
+    as_tsibble(index = datetime)
+  
+  fit_sarima_i <- resid_i %>% model(sarima = sarima_spec_1)   # <- sarima_1 spec here
+  fc_epsilon_i <- fit_sarima_i %>% forecast(h = 24)
+  
+  newdata_i <- df %>%
+    filter(datetime >= origin, datetime < origin + hours(24)) %>%
+    select(datetime, area6, is_weekend, hour_f, month_f) %>%
+    as_tsibble(index = datetime)
+  
+  fc_mean_i <- fit_reg_i %>% forecast(new_data = newdata_i)
+  
+  roll_results_1[[i]] <- tibble(
+    datetime = newdata_i$datetime,
+    horizon  = 1:24,
+    actual   = newdata_i$area6,
+    forecast = fc_mean_i$.mean + fc_epsilon_i$.mean
+  )
+}
+
+roll_fc_1 <- bind_rows(roll_results_1)
+
+err_sarima_1 <- roll_fc_1 %>%
+  mutate(origin_id = rep(1:(n() / 24), each = 24),
+         error = actual - forecast) %>%
+  select(origin_id, horizon, error) %>%
+  pivot_wider(id_cols = origin_id, names_from = horizon, values_from = error) %>%
+  select(-origin_id) %>%
+  as.matrix()
+
+dim(err_sarima_1)   # should be 31 x 24, matching err_sarima and err_ETS_mat
+
+loss_matrix_3 <- cbind(
+  SARIMA_2 = abs(as.vector(err_sarima)),      # your original ARIMA(4,0,0)(1,0,0)[24]
+  SARIMA_1 = abs(as.vector(err_sarima_1)),    # ARIMA(4,0,0), no seasonal term
+  ETS      = abs(as.vector(err_ETS_mat))
+)
+
+mcs_result_3 <- MCSprocedure(Loss = loss_matrix_3, alpha = 0.05, B = 5000,
+                             statistic = "Tmax", verbose = TRUE)
